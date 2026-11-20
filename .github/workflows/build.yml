@@ -1,0 +1,145 @@
+name: Build AMMDS Launcher
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  AMMDS_CORE_REPO: MengSenStudio/AMMDS
+  AMMDS_CORE_FALLBACK_REPO: MengSenStudio/AMMDS-Docker
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install Inno Setup
+        run: |
+          # Try installing with chocolatey first, fallback to winget if needed
+          try {
+            choco install innosetup -y
+            Write-Host "Installed Inno Setup using Chocolatey"
+          } catch {
+            Write-Host "Chocolatey install failed, trying winget..."
+            winget install --id JRSoftware.InnoSetup --accept-package-agreements --accept-source-agreements
+          }
+
+      - name: Setup Environment
+        run: |
+          # Refresh environment to make ISCC available
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          Get-ChildItem "${env:ProgramFiles}\Inno Setup *\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+
+          # Ensure Go bin directory is in PATH for goversioninfo
+          $goPath = go env GOPATH
+          $goBinPath = Join-Path $goPath "bin"
+          echo $goBinPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added Go bin path to PATH: $goBinPath"
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          if ($tag -match '^v(\d+\.\d+\.\d+)$') {
+            echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
+            echo "TAG_VERSION=$tag" >> $env:GITHUB_OUTPUT
+          } else {
+            throw "Invalid tag format. Expected format: v1.2.3"
+          }
+
+      - name: Update version file
+        run: |
+          $version = "${{ steps.extract_version.outputs.VERSION }}"
+          Set-Content -Path version -Value $version -NoNewline
+          Write-Host "Updated version file to: $version"
+
+      - name: Download AMMDS v2 core
+        shell: pwsh
+        env:
+          CORE_ZIP_URL: ${{ vars.AMMDS_CORE_ZIP_URL }}
+        run: |
+          $tagVersion = "${{ steps.extract_version.outputs.TAG_VERSION }}"
+          $candidates = @()
+          if ($env:CORE_ZIP_URL) {
+            $candidates += $env:CORE_ZIP_URL
+          }
+          foreach ($name in @("ammds.zip", "ammds-windows.zip", "ammds-windows-amd64.zip")) {
+            $candidates += "https://github.com/$env:AMMDS_CORE_REPO/releases/download/$tagVersion/$name"
+          }
+          $candidates += "https://github.com/$env:AMMDS_CORE_FALLBACK_REPO/releases/download/$tagVersion/ammds.zip"
+
+          $downloaded = $null
+          foreach ($url in $candidates) {
+            try {
+              Write-Host "Trying core package: $url"
+              Invoke-WebRequest -Uri $url -OutFile "ammds-core.zip" -UseBasicParsing
+              $downloaded = $url
+              break
+            } catch {
+              Write-Warning "Not available: $url"
+            }
+          }
+          if (-not $downloaded) {
+            throw "Unable to download AMMDS v2 core. Set repository variable AMMDS_CORE_ZIP_URL to a valid zip URL."
+          }
+          Write-Host "Downloaded AMMDS v2 core from: $downloaded"
+
+          if (Test-Path "ammds-core") { Remove-Item "ammds-core" -Recurse -Force }
+          Expand-Archive -Path "ammds-core.zip" -DestinationPath "ammds-core" -Force
+          $coreExe = Get-ChildItem "ammds-core" -Filter "ammds.exe" -Recurse | Select-Object -First 1
+          if (-not $coreExe) {
+            throw "ammds.exe not found in downloaded AMMDS v2 core package"
+          }
+          Copy-Item $coreExe.FullName "ammds.exe" -Force
+          Write-Host "Extracted ammds.exe from AMMDS v2 core"
+
+      - name: Build AMMDS Launcher and Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\build.ps1 -Version "${{ steps.extract_version.outputs.VERSION }}"
+
+      - name: Package executables
+        run: |
+          # dist 中必须包含启动器、ammds.exe、AWT 运行库和 lib/fontconfig.bfc
+          $zipPath = "dist\ammds.zip"
+          $filesToZip = @(
+            "dist\AMMDS-Launcher.exe",
+            "dist\ammds.exe",
+            "dist\icon.ico",
+            "dist\logo.ico"
+          )
+          $filesToZip += (Get-ChildItem "dist\*.dll" -File | Select-Object -ExpandProperty FullName)
+          if (Test-Path "dist\lib") {
+            $filesToZip += "dist\lib"
+          }
+
+          foreach ($file in $filesToZip) {
+            if (-not (Test-Path $file)) {
+              throw "File not found: $file"
+            }
+          }
+
+          Compress-Archive -Path $filesToZip -DestinationPath $zipPath -Force
+          Write-Host "Created zip package: $zipPath"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/ammds-setup.exe
+            dist/ammds.zip
+          tag_name: ${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
