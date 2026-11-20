@@ -1,0 +1,128 @@
+name: Build AMMDS Launcher
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install Inno Setup
+        run: |
+          # Try installing with chocolatey first, fallback to winget if needed
+          try {
+            choco install innosetup -y
+            Write-Host "Installed Inno Setup using Chocolatey"
+          } catch {
+            Write-Host "Chocolatey install failed, trying winget..."
+            winget install --id JRSoftware.InnoSetup --accept-package-agreements --accept-source-agreements
+          }
+
+      - name: Setup Environment
+        run: |
+          # Refresh environment to make ISCC available
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          # Verify ISCC.exe is accessible
+          Get-Command ISCC.exe
+          
+          # Ensure Go bin directory is in PATH for rsrc tool
+          $goPath = go env GOPATH
+          $goBinPath = Join-Path $goPath "bin"
+          echo $goBinPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Added Go bin path to PATH: $goBinPath"
+
+      - name: Install Custom Language Files
+        run: |
+          # Copy custom language files to Inno Setup directory
+          $innoLangDir = "C:\Program Files (x86)\Inno Setup 6\Languages"
+          if (Test-Path "Languages") {
+            Write-Host "Copying custom language files to Inno Setup directory..."
+            Copy-Item "Languages\*" $innoLangDir -Force
+            Write-Host "Language files copied successfully."
+          } else {
+            Write-Warning "Languages directory not found in project root."
+          }
+
+      - name: Extract version from tag
+        id: extract_version
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          if ($tag -match '^v(\d+\.\d+\.\d+)$') {
+            echo "VERSION=$($matches[1])" >> $env:GITHUB_OUTPUT
+            echo "TAG_VERSION=$tag" >> $env:GITHUB_OUTPUT
+          } else {
+            throw "Invalid tag format. Expected format: v1.2.3"
+          }
+
+      - name: Update version file
+        run: |
+          $version = "${{ steps.extract_version.outputs.VERSION }}"
+          Set-Content -Path version -Value $version
+          Write-Host "Updated version file to: $version"
+
+      - name: Download AMMDS core from Docker repository
+        run: |
+          $tagVersion = "${{ steps.extract_version.outputs.TAG_VERSION }}"
+          $downloadUrl = "https://github.com/QYG2297248353/AMMDS-Docker/releases/download/$tagVersion/ammds.zip"
+          Write-Host "Downloading from: $downloadUrl"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "ammds.zip"
+          
+      - name: Extract AMMDS core
+        run: |
+          Expand-Archive -Path "ammds.zip" -DestinationPath "." -Force
+          if (Test-Path "ammds.exe") {
+            Write-Host "Successfully extracted ammds.exe"
+          } else {
+            throw "Failed to extract ammds.exe from archive"
+          }
+
+      - name: Build AMMDS Launcher and Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\build.ps1 -Version "${{ steps.extract_version.outputs.VERSION }}"
+
+      - name: Package executables
+        run: |
+          # Create a zip file containing the executables
+          $zipPath = "dist\ammds.zip"
+          $filesToZip = @("dist\AMMDS-Launcher.exe", "dist\ammds.exe")
+          
+          # Check if files exist
+          $allFilesExist = $true
+          foreach ($file in $filesToZip) {
+            if (-not (Test-Path $file)) {
+              Write-Warning "File not found: $file"
+              $allFilesExist = $false
+            }
+          }
+          
+          if ($allFilesExist) {
+            # Compress files into a zip archive
+            Compress-Archive -Path $filesToZip -DestinationPath $zipPath -Force
+            Write-Host "Created zip package: $zipPath"
+          } else {
+            throw "Cannot create zip package because some files are missing"
+          }
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/ammds-setup.exe
+            dist/ammds.zip
+          tag_name: ${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
